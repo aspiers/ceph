@@ -44,6 +44,7 @@ class MPoolOpReply;
 class MGetPoolStatsReply;
 class MStatfsReply;
 class MCommandReply;
+class MWatchNotify;
 
 class PerfCounters;
 
@@ -1470,7 +1471,8 @@ public:
     bufferlist *poutbl;
     version_t *pobjver;
 
-    uint64_t cookie;   ///< non-zero if this is a watch
+    bool is_watch;
+    uint64_t cookie;
     utime_t watch_valid_thru; ///< send time for last acked ping
     int last_error;  ///< error from last failed ping|reconnect, if any
     Mutex watch_lock;
@@ -1478,7 +1480,15 @@ public:
 
     bool registered;
     bool canceled;
-    Context *on_reg_ack, *on_reg_commit, *on_error;
+    Context *on_reg_ack, *on_reg_commit;
+
+    // we trigger these from an async finisher
+    Context *on_notify_finish;
+    bufferlist *notify_result_bl;
+
+    Context *on_watch_error;
+    Context *on_watch_notify;
+    Context *on_watch_failed_notify;
 
     OSDSession *session;
 
@@ -1490,13 +1500,18 @@ public:
 		 target(object_t(), object_locator_t(), 0),
 		 snap(CEPH_NOSNAP),
 		 poutbl(NULL), pobjver(NULL),
+		 is_watch(false),
 		 cookie(0),
 		 last_error(0),
 		 watch_lock("Objecter::LingerOp::watch_lock"),
 		 registered(false),
 		 canceled(false),
 		 on_reg_ack(NULL), on_reg_commit(NULL),
-		 on_error(NULL),
+		 on_notify_finish(NULL),
+		 notify_result_bl(NULL),
+		 on_watch_error(NULL),
+		 on_watch_notify(NULL),
+		 on_watch_failed_notify(NULL),
 		 session(NULL),
 		 register_tid(0),
 		 ping_tid(0),
@@ -1823,6 +1838,7 @@ public:
   }
 
   void handle_osd_op_reply(class MOSDOpReply *m);
+  void handle_watch_notify(class MWatchNotify *m);
   void handle_osd_map(class MOSDMap *m);
   void wait_for_osd_map();
 
@@ -1994,6 +2010,8 @@ public:
   int linger_check(LingerOp *info);
   void linger_cancel(LingerOp *info);  // releases a reference
   void _linger_cancel(LingerOp *info);
+
+  void _do_watch_notify(LingerOp *info, MWatchNotify *m);
 
   /**
    * set up initial ops in the op vector, and allocate a final op slot.

@@ -40,6 +40,8 @@
 #include "messages/MCommand.h"
 #include "messages/MCommandReply.h"
 
+#include "messages/MWatchNotify.h"
+
 #include <errno.h>
 
 #include "common/config.h"
@@ -492,8 +494,8 @@ void Objecter::_linger_reconnect(LingerOp *info, int r)
     info->watch_lock.Lock();
     info->last_error = r;
     info->watch_cond.Signal();
-    if (info->on_error)
-      info->on_error->complete(r);
+    if (info->on_watch_error)
+      info->on_watch_error->complete(r);
     info->watch_lock.Unlock();
   }
 }
@@ -548,8 +550,8 @@ void Objecter::_linger_ping(LingerOp *info, int r, utime_t sent)
     info->watch_valid_thru = sent;
   } else if (r < 0) {
     info->last_error = r;
-    if (info->on_error)
-      info->on_error->complete(r);
+    if (info->on_watch_error)
+      info->on_watch_error->complete(r);
   }
   info->watch_cond.SignalAll();
   info->watch_lock.Unlock();
@@ -628,6 +630,7 @@ ceph_tid_t Objecter::linger_watch(LingerOp *info,
 				  Context *onerror,
 				  version_t *objver)
 {
+  info->is_watch = true;
   info->snapc = snapc;
   info->mtime = mtime;
   info->target.flags |= CEPH_OSD_FLAG_WRITE;
@@ -638,7 +641,7 @@ ceph_tid_t Objecter::linger_watch(LingerOp *info,
   info->pobjver = objver;
   info->on_reg_ack = onack;
   info->on_reg_commit = oncommit;
-  info->on_error = onerror;
+  info->on_watch_error = onerror;
 
   RWLock::WLocker wl(rwlock);
   _linger_submit(info);
@@ -691,6 +694,66 @@ void Objecter::_linger_submit(LingerOp *info)
   _send_linger(info);
 }
 
+struct C_DoWatchNotify : public Context {
+  Objecter *objecter;
+  Objecter::LingerOp *info;
+  MWatchNotify *msg;
+  C_DoWatchNotify(Objecter *o, Objecter::LingerOp *i, MWatchNotify *m)
+    : objecter(o), info(i), msg(m) {
+    info->get();
+    msg->get();
+  }
+  void finish(int r) {
+    objecter->_do_watch_notify(info, msg);
+  }
+};
+
+void Objecter::handle_watch_notify(MWatchNotify *m)
+{
+  RWLock::RLocker l(rwlock);
+  if (!initialized.read()) {
+    return;
+  }
+
+  map<uint64_t,LingerOp*>::iterator p = linger_ops.find(m->cookie);
+  if (p == linger_ops.end()) {
+    ldout(cct, 7) << __func__ << " cookie " << m->cookie << " dne" << dendl;
+    return;
+  }
+
+  LingerOp *info = p->second;
+  finisher->queue(new C_DoWatchNotify(this, info, m));
+}
+
+void Objecter::_do_watch_notify(LingerOp *info, MWatchNotify *m)
+{
+  ldout(cct, 10) << __func__ << " " << *m << dendl;
+
+  RWLock::RLocker l(rwlock);
+  if (!initialized.read())
+    goto out;
+
+  if (info->canceled)
+    goto out;
+
+  // notify completion?
+  if (!info->is_watch) {
+    assert(info->on_notify_finish);
+#warning FIXME use claim
+    *info->notify_result_bl = m->get_data();
+    rwlock.put_read();
+    info->on_notify_finish->complete(m->return_code);
+    rwlock.get_read();
+    goto out;
+  }
+
+  assert(info->is_watch);
+
+ out:
+  info->put();
+  m->put();
+}
+
 bool Objecter::ms_dispatch(Message *m)
 {
   ldout(cct, 10) << __func__ << " " << cct << " " << *m << dendl;
@@ -702,6 +765,11 @@ bool Objecter::ms_dispatch(Message *m)
   case CEPH_MSG_OSD_OPREPLY:
     handle_osd_op_reply(static_cast<MOSDOpReply*>(m));
     return true;
+
+  case CEPH_MSG_WATCH_NOTIFY:
+    handle_watch_notify(static_cast<MWatchNotify*>(m));
+#warning FIXME give librados a chance for now
+    return false;
 
   case MSG_COMMAND_REPLY:
     if (m->get_source().type() == CEPH_ENTITY_TYPE_OSD) {
@@ -1715,7 +1783,7 @@ void Objecter::tick()
         assert(op->session);
         ldout(cct, 10) << " pinging osd that serves lingering tid " << p->first << " (osd." << op->session->osd << ")" << dendl;
         toping.insert(op->session);
-	if (op->cookie && !op->last_error)
+	if (op->is_watch && !op->last_error)
 	  _send_linger_ping(op);
       }
       for (map<uint64_t,CommandOp*>::iterator p = s->command_ops.begin();
@@ -2651,7 +2719,6 @@ void Objecter::handle_osd_op_reply(MOSDOpReply *m)
     m->put();
     return;
   }
-
   RWLock::Context lc(rwlock, RWLock::Context::TakenForRead);
 
   map<int, OSDSession *>::iterator siter = osd_sessions.find(osd_num);
