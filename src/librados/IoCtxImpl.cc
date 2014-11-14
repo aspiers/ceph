@@ -1041,46 +1041,86 @@ void librados::IoCtxImpl::set_sync_op_version(version_t ver)
   last_objver = ver;
 }
 
+struct WatchInfo : public Objecter::WatchContext {
+  librados::IoCtxImpl *ioctx;
+  object_t oid;
+  librados::WatchCtx *ctx;
+  librados::WatchCtx2 *ctx2;
+
+  WatchInfo(librados::IoCtxImpl *io, object_t o,
+	    librados::WatchCtx *c, librados::WatchCtx2 *c2)
+    : ioctx(io), oid(o), ctx(c), ctx2(c2) {}
+
+  void handle_notify(uint64_t notify_id,
+		     uint64_t cookie,
+		     uint64_t notifier_id,
+		     bufferlist& bl) {
+    ldout(ioctx->client->cct, 10) << __func__ << " " << notify_id
+				  << " cookie " << cookie
+				  << " notifier_id " << notifier_id
+				  << " len " << bl.length()
+				  << dendl;
+
+    if (ctx2)
+      ctx2->handle_notify(notify_id, cookie, notifier_id, bl);
+    if (ctx) {
+      ctx->notify(0, 0, bl);
+
+      // send ACK back to OSD if using legacy protocol
+      bufferlist empty;
+      ioctx->notify_ack(oid, notify_id, cookie, empty);
+    }
+  }
+  void handle_failed_notify(uint64_t notify_id,
+			    uint64_t cookie,
+			    uint64_t notifier_id) {
+    ldout(ioctx->client->cct, 10) << __func__ << " " << notify_id
+				  << " cookie " << cookie
+				  << " notifier_id " << notifier_id
+				  << dendl;
+    if (ctx2)
+      ctx2->handle_failed_notify(notify_id, cookie, notifier_id);
+  }
+  void handle_error(uint64_t cookie, int err) {
+    ldout(ioctx->client->cct, 10) << __func__ << " cookie " << cookie
+				  << " err " << err
+				  << dendl;
+    if (ctx2)
+      ctx2->handle_error(cookie, err);
+  }
+};
+
 int librados::IoCtxImpl::watch(const object_t& oid,
-			       uint64_t *cookie,
+			       uint64_t *handle,
 			       librados::WatchCtx *ctx,
 			       librados::WatchCtx2 *ctx2)
 {
   ::ObjectOperation wr;
-  Mutex mylock("IoCtxImpl::watch::mylock");
-  Cond cond;
-  bool done;
-  int r;
-  Context *onfinish = new C_SafeCond(&mylock, &cond, &done, &r);
   version_t objver;
+  C_SaferCond onfinish;
 
   lock->Lock();
 
-  WatchNotifyInfo *wc = new WatchNotifyInfo(this, oid);
-  wc->watch_ctx = ctx;
-  wc->watch_ctx2 = ctx2;
-  wc->linger_op = objecter->linger_register(oid, oloc, 0, cookie);
-  client->register_watch_notify_callback(wc, *cookie);
+  Objecter::LingerOp *linger_op = objecter->linger_register(oid, oloc, 0, cookie);
+  linger_op->watch_context = new WatchInfo(this, oid, ctx, ctx2);
+
   prepare_assert_ops(&wr);
   wr.watch(*cookie, CEPH_OSD_WATCH_OP_WATCH);
   bufferlist bl;
-  objecter->linger_watch(wc->linger_op, wr,
+  objecter->linger_watch(linger_op, wr,
 			 snapc, ceph_clock_now(NULL), bl,
 			 *cookie,
-			 NULL, onfinish, &wc->on_error,
+			 NULL, &onfinish,
 			 &objver);
   lock->Unlock();
 
-  mylock.Lock();
-  while (!done)
-    cond.Wait(mylock);
-  mylock.Unlock();
+  int r = onfinish.wait();
 
   set_sync_op_version(objver);
 
   if (r < 0) {
     lock->Lock();
-    client->unregister_watch_notify_callback(*cookie, NULL); // destroys wc
+    objecter->linger_cancel(linger_op);
     lock->Unlock();
   }
 

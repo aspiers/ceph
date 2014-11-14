@@ -1457,6 +1457,19 @@ public:
 
   // -- lingering ops --
 
+  struct WatchContext {
+    // this simply mirrors librados WatchCtx2
+    virtual void handle_notify(uint64_t notify_id,
+			       uint64_t cookie,
+			       uint64_t notifier_id,
+			       bufferlist& bl) = 0;
+    virtual void handle_failed_notify(uint64_t notify_id,
+				      uint64_t cookie,
+				      uint64_t notifier_id) = 0;
+    virtual void handle_error(uint64_t cookie, int err) = 0;
+    virtual ~WatchContext() {}
+  };
+
   struct LingerOp : public RefCountedObject {
     uint64_t linger_id;
 
@@ -1486,9 +1499,7 @@ public:
     Context *on_notify_finish;
     bufferlist *notify_result_bl;
 
-    Context *on_watch_error;
-    Context *on_watch_notify;
-    Context *on_watch_failed_notify;
+    WatchContext *watch_context;
 
     OSDSession *session;
 
@@ -1509,9 +1520,7 @@ public:
 		 on_reg_ack(NULL), on_reg_commit(NULL),
 		 on_notify_finish(NULL),
 		 notify_result_bl(NULL),
-		 on_watch_error(NULL),
-		 on_watch_notify(NULL),
-		 on_watch_failed_notify(NULL),
+		 watch_context(NULL),
 		 session(NULL),
 		 register_tid(0),
 		 ping_tid(0),
@@ -1828,6 +1837,7 @@ public:
   bool ms_can_fast_dispatch(Message *m) const {
     switch (m->get_type()) {
     case CEPH_MSG_OSD_OPREPLY:
+    case CEPH_MSG_WATCH_NOTIFY:
       return true;
     default:
       return false;
@@ -1999,7 +2009,7 @@ public:
 			  ObjectOperation& op,
 			  const SnapContext& snapc, utime_t mtime,
 			  bufferlist& inbl, uint64_t cookie,
-			  Context *onack, Context *onfinish, Context *onerror,
+			  Context *onack, Context *onfinish,
 			  version_t *objver);
   ceph_tid_t linger_notify(LingerOp *info,
 			   ObjectOperation& op,
